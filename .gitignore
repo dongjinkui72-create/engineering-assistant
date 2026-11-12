@@ -1,0 +1,32 @@
+# 编译与缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 打包产物
+build/
+dist/
+*.manifest
+
+# 本地运行输出与日志
+out/
+*.log
+build_log.txt
+
+# 开发过程中的临时脚本、备份与一次性探针
+tmp_*.py
+tmp_*/
+work_nx_probe/
+_codex_run.txt
+result.json
+*.bak
+*.bak_*
+tools/
+tests/_local/
+
+# 本机配置与任何密钥
+*.env
+.env
+settings.json
+*.token
+assets/icon_url.txt

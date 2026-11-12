@@ -1,0 +1,19 @@
+{
+  "part_name": "安装板",
+  "base_kind": "rect",
+  "length": 160.0,
+  "width": 100.0,
+  "thickness": 12.0,
+  "corner_radius": 2.0,
+  "chamfer": 2.0,
+  "_source": "像素实测 5.000 px/mm，samples/sample_plate.png，精度 ±0.2 mm",
+  "_note": "型腔与槽的位置图上没有标注，实测都不居中：型腔中心 y=-10，槽中心 y=+32。识图目前给的是 y=0 和 y=+25，均为『居中假设』。",
+  "features": [
+    { "type": "pocket", "x": 0.0, "y": -10.0, "length": 80.0, "width": 50.0, "depth": 6.0 },
+    { "type": "slot", "x": 0.0, "y": 32.0, "length": 30.0, "width": 10.0, "through": true },
+    { "type": "hole", "diameter": 9.0, "x": -65.0, "y": 38.0, "through": true },
+    { "type": "hole", "diameter": 9.0, "x": 65.0, "y": 38.0, "through": true },
+    { "type": "hole", "diameter": 9.0, "x": -65.0, "y": -38.0, "through": true },
+    { "type": "hole", "diameter": 9.0, "x": 65.0, "y": -38.0, "through": true }
+  ]
+}
