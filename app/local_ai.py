@@ -567,6 +567,18 @@ def status(settings: Any) -> dict:
     model = str(getattr(settings, "local_ai_model", DEFAULT_MODEL) or DEFAULT_MODEL)
     out = {"enabled": bool(getattr(settings, "local_ai_enabled", True)),
            "model": model, "url": _url(settings), "ready": False, "detail": ""}
+    try:
+        from . import ai_tiers
+        info = ai_tiers.describe()
+        out.update({
+            "ram_gb": info["ram_gb"],
+            "recommended_model": info["model"],
+            "tier_label": info["label"],
+            "tier_matches": model == info["model"],
+            "low_memory": info["low_memory"],
+        })
+    except Exception:
+        pass
     if not out["enabled"]:
         out["detail"] = "已关闭"
         return out

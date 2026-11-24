@@ -73,9 +73,11 @@ class Settings:
     def load() -> "Settings":
         s = Settings()
         p = app_data_dir() / "settings.json"
+        user_model = ""
         if p.exists():
             try:
                 d = json.loads(p.read_text(encoding="utf-8"))
+                user_model = str(d.get("local_ai_model") or "").strip()
                 for k, v in d.items():
                     if hasattr(s, k) and v not in (None, ""):
                         setattr(s, k, v)
@@ -85,9 +87,15 @@ class Settings:
         # 现在随包运行时固定用 11511，避免与用户自己的 Ollama 抢端口。
         if str(getattr(s, "local_ai_url", "")).rstrip("/") == "http://127.0.0.1:11434":
             s.local_ai_url = "http://127.0.0.1:11511"
-        # 旧默认模型 qwen3-vl:2b 结构化读图不合格，已换成 7B。
-        if str(getattr(s, "local_ai_model", "") or "") in ("", "qwen3-vl:2b"):
-            s.local_ai_model = "qwen2.5vl:7b"
+        # 没有用户手动配置时，按物理内存选本地识图模型。
+        # 用户自己写进 settings.json 的模型永远优先，绝不被覆盖。
+        cur_model = str(getattr(s, "local_ai_model", "") or "").strip()
+        if not user_model or cur_model == "qwen3-vl:2b":
+            try:
+                from .ai_tiers import recommended_model
+                s.local_ai_model = recommended_model()
+            except Exception:
+                s.local_ai_model = "qwen2.5vl:7b"
         cfg = _read_codex_toml()
         if not s.api_key:
             s.api_key = cfg.get("api_key", "") or os.environ.get("DASHSCOPE_API_KEY", "")
