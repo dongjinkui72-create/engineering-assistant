@@ -1,6 +1,6 @@
 """运行时能力探测：不看版本号，直接查 API 是否存在。
 
-新版本（NX 1847+/2306、SW 2025/2026、CATIA R22~R33）即使接口有增减，
+新版本（NX 1847+/2306、SW 2025/2026）即使接口有增减，
 也能在启动时探测出来，并按结果选择调用方式或给出明确提示。
 """
 from __future__ import annotations
@@ -15,9 +15,6 @@ CHECK_SW = ["FeatureCut4", "FeatureCut3", "FeatureCut2", "FeatureExtrusion2",
             "InsertFeatureChamfer", "FeatureFillet3", "FeatureFillet2",
             "FeatureRevolve2", "InsertRefPlane", "InsertSheetMetalBaseFlange2",
             "AddComponent5", "SelectByRay"]
-CHECK_CATIA = ["AddNewPad", "AddNewPocket", "AddNewShaft", "AddNewLoft",
-               "AddNewChamfer", "AddNewEdgeFilletWithConstantRadius",
-               "AddNewHole", "AddNewRib"]
 CHECK_NX = ["CreateChamferBuilder", "CreateEdgeBlendBuilder", "CreateExtrudeBuilder",
             "CreateRevolveBuilder", "CreateThroughCurvesBuilder", "CreateBooleanBuilder",
             "CreateHoleFeatureBuilder", "CreatePatternFeatureBuilder"]
@@ -63,100 +60,7 @@ def probe_solidworks(path: str) -> Dict:
     return out
 
 
-def probe_catia(app=None) -> Dict:
-    out = {"cad": "CATIA", "ok": False, "caps": {}, "version": ""}
-    acquired = False
-    try:
-        from .cad.guard import acquire as _acquire, release as _release
-        # CATIA ?????????????????? GetActiveObject
-        # ??? SolidWorks/NX ????????????
-        _acquire("CATIA")
-        acquired = True
-        import pythoncom
-        import win32com.client as win32
-        from win32com.client import dynamic
-        pythoncom.CoInitialize()
-        a = app or win32.GetActiveObject("CATIA.Application")
-        out["version"] = getattr(a, "Caption", "CATIA V5")
-        doc = a.Documents.Add("Part")
-        sf = doc.Part.ShapeFactory
-        ids = dynamic.Dispatch(sf)._oleobj_
-        for c in CHECK_CATIA:
-            try:
-                ids.GetIDsOfNames(c)
-                out["caps"][c] = True
-            except Exception:
-                out["caps"][c] = False
-        doc.Close()
-        out["ok"] = True
-    except Exception as e:
-        out["error"] = str(e)[:120]
-    finally:
-        if acquired:
-            try:
-                _release()
-            except Exception:
-                pass
-    return out
-
-
-NX_JOURNAL = r'''
-import NXOpen, json
-s = NXOpen.Session.GetSession()
-part = s.Parts.NewDisplay(__TMP__, NXOpen.Part.Units.Millimeters)
-res = {"cad": "NX", "ok": True, "caps": {}, "version": ""}
-try:
-    res["version"] = "NX " + s.GetEnvironmentVariableValue("UGII_VERSION")
-except Exception:
-    pass
-F = part.Features
-for name in __NAMES__:
-    res["caps"][name] = hasattr(F, name)
-json.dump(res, open(__OUT__, "w", encoding="utf-8"), ensure_ascii=False)
-'''
-
-
-def probe_nx(nx_root: str, work_dir: str) -> Dict:
-    out = {"cad": "NX", "ok": False, "caps": {}, "version": ""}
-    acquired = False
-    from .cad.guard import acquire as _acquire, release as _release
-    rj = Path(nx_root) / "NXBIN" / "run_journal.exe"
-    if not rj.exists():
-        out["error"] = f"未找到 {rj}"
-        return out
-    try:
-        # run_journal ??? ugraf/NX ????????????????????
-        _acquire("NX")
-        acquired = True
-        w = Path(work_dir).resolve()
-        w.mkdir(parents=True, exist_ok=True)
-        out_json = w / "nx_caps.json"
-        tmp = w / "_caps.prt"
-        script = w / "caps_journal.py"
-        text = (NX_JOURNAL.replace("__TMP__", repr(str(tmp)))
-                           .replace("__OUT__", repr(str(out_json)))
-                           .replace("__NAMES__", repr(CHECK_NX)))
-        script.write_text(text, encoding="utf-8")
-        proc = subprocess.run([str(rj), str(script)], capture_output=True, timeout=180,
-                              cwd=str(w), encoding="mbcs", errors="replace")
-        if not out_json.exists():
-            out["error"] = (proc.stdout or proc.stderr or "journal 未产生结果")[-200:]
-        if out_json.exists():
-            d = json.loads(out_json.read_text(encoding="utf-8"))
-            d["ok"] = True
-            return d
-    except Exception as e:
-        out["error"] = str(e)[:120]
-    finally:
-        if acquired:
-            try:
-                _release()
-            except Exception:
-                pass
-    return out
-
-
-def probe_all(settings, work_dir: str, with_catia: bool = False) -> List[Dict]:
+def probe_all(settings, work_dir: str) -> List[Dict]:
     res = []
     try:
         from .compat import detect_sw
@@ -168,11 +72,6 @@ def probe_all(settings, work_dir: str, with_catia: bool = False) -> List[Dict]:
         res.append(probe_nx(settings.nx_root, work_dir))
     except Exception as e:
         res.append({"cad": "NX", "ok": False, "error": str(e)[:120], "caps": {}})
-    if with_catia:
-        try:
-            res.append(probe_catia())
-        except Exception as e:
-            res.append({"cad": "CATIA", "ok": False, "error": str(e)[:120], "caps": {}})
     return res
 
 

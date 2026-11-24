@@ -29,6 +29,7 @@ OUT_STP = __STP__
 OUT_PNG = __PNG__
 SHEET = __SHEET__
 BASE_OUTLINE = __BASE_OUTLINE__
+BASE_PROFILE = __BASE_PROFILE__
 GEAR = __GEAR__
 CHAMFER = __CHAMFER__
 FILLET = __FILLET__
@@ -166,8 +167,41 @@ def main():
                    else ("line", (xl, r), (xl, -r)))
         return out
 
-    def cut_segs(segs, z0, z1, note=""):
-        """把直线/圆弧段拉伸切除。曲线全部由 NX 原生 CreateLine/CreateArc 生成。"""
+    def _nx_segs_from_profile(prof):
+        """通用闭合轮廓 dict -> [("line",p1,p2) | ("arc",p1,pm,p2)]。
+
+        圆弧保持解析：起点/中点/终点三点式，交给 Curves.CreateArc，
+        绝不按角度采样成折线。与 _inner_segs() 输出格式一致。
+        """
+        out = []
+        for sg in (prof or []):
+            if not isinstance(sg, dict):
+                continue
+            _typ = str(sg.get("type") or "line").lower()
+            _a = [float(v) for v in (sg.get("p1") or (0.0, 0.0))[:2]]
+            _b = [float(v) for v in (sg.get("p2") or (0.0, 0.0))[:2]]
+            if _typ == "arc":
+                _c = [float(v) for v in (sg.get("center") or (0.0, 0.0))[:2]]
+                _r = math.hypot(_a[0] - _c[0], _a[1] - _c[1])
+                if _r <= 1e-9:
+                    continue
+                _t1 = math.atan2(_a[1] - _c[1], _a[0] - _c[0])
+                _t2 = math.atan2(_b[1] - _c[1], _b[0] - _c[0])
+                _d = (_t2 - _t1) % (2.0 * math.pi)
+                if int(sg.get("dir") or 1) < 0:
+                    _d = -((_t1 - _t2) % (2.0 * math.pi))
+                _tm = _t1 + _d / 2.0
+                out.append(("arc", (_a[0], _a[1]),
+                            (_c[0] + _r * math.cos(_tm), _c[1] + _r * math.sin(_tm)),
+                            (_b[0], _b[1])))
+            else:
+                out.append(("line", (_a[0], _a[1]), (_b[0], _b[1])))
+        return out
+
+    def _extrude_segs(segs, z0, z1, note="", subtract=True):
+        """直线/圆弧段拉伸。subtract=True 从实体切除，False 生成新实体（基体）。"""
+        if not segs:
+            raise RuntimeError("拉伸轮廓为空：" + note)
         curves = []
         def _ln(p1, p2):
             curves.append(part.Curves.CreateLine(NXOpen.Point3d(p1[0], p1[1], 0.0),
@@ -197,10 +231,15 @@ def main():
         eb.Direction = d
         eb.Limits.StartExtend.SetValue(str(float(z0)))
         eb.Limits.EndExtend.SetValue(str(float(z1)))
-        eb.BooleanOperation.SetBooleanOperationAndBody(SUB, body0())
+        if subtract:
+            eb.BooleanOperation.SetBooleanOperationAndBody(SUB, body0())
         eb.Commit()
         eb.Destroy()
-        log.append("方块切除 " + note)
+        log.append(("方块切除 " if subtract else "轮廓拉伸 ") + note)
+
+    def cut_segs(segs, z0, z1, note=""):
+        """把直线/圆弧段拉伸切除。曲线全部由 NX 原生 CreateLine/CreateArc 生成。"""
+        _extrude_segs(segs, z0, z1, note, True)
 
     def _base_with_ends(L, W, T):
         """圆弧头基体：草图（直线 + 圆弧）→ 拉伸 → 与方块求交归一化。
@@ -333,12 +372,12 @@ def main():
             z += float(seg.get("length") or 10.0)
         log.append("回转体 %d 段，总长 %g" % (len(SEGS), z))
     elif REVOLVE:
-        # ??????????r,z?? Z ? 360????? CreateLine?
-        # ?????? CreateArc?????????????????
+        # 轴对称建议：每段线仅用 CreateLine / CreateArc 实体曲线，不用点列
+        # 相切处走真实圆弧，不折线拟合
         try:
             _prof = [q for q in (REVOLVE or []) if isinstance(q, dict)]
             if len(_prof) < 3:
-                raise RuntimeError("?????? 3 ?")
+                raise RuntimeError("回转母线至少需要 3 段")
             _curves = []
             _nl = _na = 0
             for _seg in _prof:
@@ -387,11 +426,11 @@ def main():
             _rb.Limits.EndExtend.SetValue("360")
             _rb.Commit()
             _rb.Destroy()
-            log.append("???? %g ???? %d + ??? %d???? 360?"
+            log.append("回转体 %g 段：线 %d + 弧 %d，绕 Z 轴 360°"
                        % (len(_prof), _nl, _na))
         except Exception as _e_rv:
-            log.append("??????: %s" % _e_rv)
-            res.setdefault("failed", []).append("???? Revolve")
+            log.append("回转构造失败：%s" % _e_rv)
+            res.setdefault("failed", []).append("回转体 Revolve 失败")
 
     elif SPEC.get("base_kind") == "round":
         d = float(SPEC["diameter"] or SPEC["length"])
@@ -405,7 +444,12 @@ def main():
         log.append("圆柱基体 Ø%g x %g" % (d, T))
     else:
         L = float(SPEC["length"]); W = float(SPEC["width"])
-        if BASE_OUTLINE:
+        if BASE_PROFILE:
+            _bp = _nx_segs_from_profile(BASE_PROFILE)
+            if len(_bp) < 3:
+                raise RuntimeError("轮廓基体段数不足：%d" % len(_bp))
+            _extrude_segs(_bp, 0.0, T, "轮廓基体（%d 段）" % len(_bp), False)
+        elif BASE_OUTLINE:
             _base_with_ends(L, W, T)
         else:
             b = F.CreateBlockFeatureBuilder(NULL)
@@ -414,8 +458,8 @@ def main():
             b.Commit()
             b.Destroy()
             log.append("方块基体 %g x %g x %g" % (L, W, T))
-        if float(CORNER_R) > 0:
-            # 四角圆角 = 4 条竖棱倒圆（与 CATIA 的做法一致，几何精确）
+        if float(CORNER_R) > 0 and not BASE_PROFILE:
+            # 四角圆角 = 4 条竖棱倒圆（几何精确）
             try:
                 vedges = []
                 for e in body0().GetEdges():
@@ -441,7 +485,7 @@ def main():
 
     # ---- shell ------------------------------------------------------------
     # 不用 F.CreateShellBuilder：本机 NX 12 在 CreateShellBuilder(NULL) 后 Commit
-    # 会卡死（实测 >100s 无返回，同一几何 SW/CATIA 都正常）。改为"外壳 − 内腔"
+    # 会卡死（实测 >100s 无返回，同一几何 SW 也正常）。改为"外壳 − 内腔"
     # 布尔切除：内腔 = 外轮廓均匀内缩 t，底面留 t；开口朝上时内腔顶到 T+0.5。
     if float(SHELL_T) > 0 and not SHEET and not GEAR and not SEGS and not REVOLVE:
         try:
@@ -531,7 +575,7 @@ def main():
             res.setdefault("failed", []).append("圆顶面 Dome")
 
     # ---- 扫掠（Sweep）：原生直线 + 原生圆弧作路径，原生矩形作截面，SweepAlongGuide 成体 ----
-    # 与 SW/CATIA 同一约定：路径整条落在 XZ 平面（所有点同一 Y），首段切向 ±X。
+    # 与 SW 同一约定：路径整条落在 XZ 平面（所有点同一 Y），首段切向 ±X。
     # 圆弧用三点式 CreateArc（起点/途径点/终点），不做点列拟合。
     if SWEEPS and not SHEET and not GEAR and not SEGS and not REVOLVE:
         _made_sw = 0
@@ -680,13 +724,26 @@ def main():
 
     # ---- features ---------------------------------------------------------
     feats_sorted = sorted(SPEC.get("features", []),
-                          key=lambda f: {"pocket": 0, "step": 1, "slot": 2, "hole": 3}.get(f.get("type"), 4))
+                          key=lambda f: {"pocket": 0, "profile_cut": 0, "step": 1,
+                                         "slot": 2, "hole": 3,
+                                         "keyway": 0}.get(f.get("type"), 4))
     for f in feats_sorted:
         t = f.get("type")
         x = float(f.get("x") or 0.0); y = float(f.get("y") or 0.0)
         depth = float(f.get("depth") or 0.0)
         through = bool(f.get("through", depth <= 0))
         grow = float(f.get("grow") or 0.0)        # 薄壁冲突时外扩，见 app/conflict.py
+        if t == "keyway":
+            # 坐标对齐：y0 = sqrt(r^2-(w/2)^2)，向外到 r+depth
+            # 与 calc.keyway_volume / sw.draw_shape 保持同一截面：从弦线 y0 切到 r+depth
+            rr = float(f.get("diameter") or 0.0) / 2.0
+            kw = float(f.get("width") or 0.0)
+            kd = float(f.get("depth") or 0.0)
+            if rr > 1e-9 and kw > 1e-9 and kd > 1e-9:
+                b = kw / 2.0
+                y0 = math.sqrt(max(rr * rr - b * b, 0.0))
+                subtract_block(-b, y0, -1.0, kw, (rr + kd) - y0, T + 2.0, "键槽")
+            continue
         if t == "hole":
             dia = float(f.get("diameter") or 6.0) + 2 * grow
             if through:
@@ -724,31 +781,56 @@ def main():
                 log.append("球坑 SR%g 深 %g（原生球体布尔切除）" % (R, h))
             except Exception as e0:
                 log.append("球坑失败: %s" % e0)
+        elif t == "profile_cut":
+            _ps = _nx_segs_from_profile(f.get("profile") or [])
+            if len(_ps) < 3:
+                log.append("轮廓切除：有效段不足（%d），跳过" % len(_ps))
+                res.setdefault("failed", []).append("轮廓切除（段数不足）")
+            else:
+                d = T if (through and depth <= 0) else max(min(depth, T), 0.5)
+                if str(f.get("face") or "top").lower() == "bottom":
+                    cut_segs(_ps, -1.0, d + 1.0, "轮廓切除（底面）")
+                else:
+                    cut_segs(_ps, max(T - d, -1.0), T + 1.0, "轮廓切除")
         elif t in ("pocket", "step", "boss"):
             L = float(f.get("length") or 10.0) + 2 * grow
             W = float(f.get("width") or 10.0) + 2 * grow
             d = T if (through and depth <= 0) else max(depth, 0.5)
-            subtract_block(x - L / 2.0, y - W / 2.0, T - d, L, W, d + 1.0, "%s" % t)
+            # face=bottom：从底面往上切。十字节的正反两条槽就靠这个区分。
+            if str(f.get("face") or "top").lower() == "bottom":
+                subtract_block(x - L / 2.0, y - W / 2.0, -1.0, L, W, d + 1.0,
+                               "%s（底面）" % t)
+            else:
+                subtract_block(x - L / 2.0, y - W / 2.0, T - d, L, W, d + 1.0, "%s" % t)
         elif t == "slot":
             L = float(f.get("length") or 20.0); W = float(f.get("width") or 8.0) + 2 * grow
             ang = float(f.get("angle") or 0.0)
             a = math.radians(ang)
             half = max((L - W) / 2.0, 0.0)
             d = T if (through and depth <= 0) else max(depth, 0.5)
-            # 腰形槽 = 中间方块 + 两端圆柱（精确）；斜槽才退化成圆柱串近似
-            cx1 = x - half * math.cos(a); cy1 = y - half * math.sin(a)
-            cx2 = x + half * math.cos(a); cy2 = y + half * math.sin(a)
-            subtract_cylinder(cx1, cy1, T - d, W, d + 1.0, "腰槽端1")
-            subtract_cylinder(cx2, cy2, T - d, W, d + 1.0, "腰槽端2")
-            if abs(ang) < 1e-6 and half > 1e-6:
-                subtract_block(x - half, y - W / 2.0, T - d, 2.0 * half, W, d + 1.0, "腰槽中段")
+            _fbot = str(f.get("face") or "top").lower() == "bottom"
+            z0 = -1.0 if _fbot else T - d
+            hh = d + 1.0
+            _ang = ang % 180.0
+            if abs(_ang) < 1e-6:
+                # 轴对齐直槽：整块一次切，两端超出盘外的部分由外圆自然裁掉
+                subtract_block(x - L / 2.0, y - W / 2.0, z0, L, W, hh,
+                               "直槽 X%s" % ("（底面）" if _fbot else ""))
+            elif abs(_ang - 90.0) < 1e-6:
+                subtract_block(x - W / 2.0, y - L / 2.0, z0, W, L, hh,
+                               "直槽 Y%s" % ("（底面）" if _fbot else ""))
             else:
+                # 斜槽：腰形 = 中间方块 + 两端圆柱，圆柱串近似（非轴对齐才走这条）
+                cx1 = x - half * math.cos(a); cy1 = y - half * math.sin(a)
+                cx2 = x + half * math.cos(a); cy2 = y + half * math.sin(a)
+                subtract_cylinder(cx1, cy1, z0, W, hh, "腰槽端1")
+                subtract_cylinder(cx2, cy2, z0, W, hh, "腰槽端2")
                 steps = max(2, int(round(half * 2 / max(W * 0.3, 0.3))))
                 for i in range(0, steps + 1):
                     tt = i / float(steps)
                     subtract_cylinder(x + (-half + 2 * half * tt) * math.cos(a),
                                       y + (-half + 2 * half * tt) * math.sin(a),
-                                      T - d, W, d + 1.0, "腰槽填充")
+                                      z0, W, hh, "腰槽填充")
 
     # ---- 倒角 / 圆角（顶面外轮廓）
     try:
@@ -1131,6 +1213,10 @@ class NxAdapter:
     def _export_step(self, prt: Path, stp: Path, log: Callable[[str], None]) -> bool:
         """用 NX 自带的 STEP214 独立转换器导出 AP214（NXOpen 内部 API 只读）。"""
         import tempfile
+        # step214ug.exe 以 cwd=STEP214UG_DIR 运行，相对路径会解析到安装目录，
+        # 导致「No parts in current input file」。统一转绝对路径。
+        prt = Path(prt).resolve()
+        stp = Path(stp).resolve()
         step_dir = Path(self.nx_root) / "STEP214UG"
         exe = step_dir / "step214ug.exe"
         if not exe.exists():
@@ -1171,6 +1257,43 @@ class NxAdapter:
         log("STEP 转换失败：" + " ".join(tail.split()))
         return False
 
+    def export_step(self, path: Path, stp: Path,
+                    log: Callable[[str], None] = lambda m: None) -> bool:
+        """??? PRT ??? STEP?AP214??? CAD ???? / ???????
+
+        ? build() ???????? CAD ????????????????????
+        """
+        path = Path(path)
+        stp = Path(stp)
+        stp.parent.mkdir(parents=True, exist_ok=True)
+        ok, msg = _mem_check(1200.0, 92.0, "NX")
+        if not ok:
+            try:
+                from .guard import free_others as _free_others
+                _free_others("NX", log, fast=True)
+            except Exception:
+                pass
+            ok, msg = _mem_check(1200.0, 92.0, "NX")
+        if not ok:
+            log("\u26a0 " + msg)
+            return False
+        if msg:
+            log(msg)
+        if not path.exists():
+            log(f"PRT ????{path}")
+            return False
+        try:
+            _cad_acquire("NX", log)
+            return bool(self._export_step(path, stp, log))
+        except Exception as e:
+            log(f"NX ?? STEP ???{e}")
+            return False
+        finally:
+            try:
+                _cad_release(log)
+            except Exception:
+                pass
+
     def build(self, spec: PartSpec, out_dir: str,
               log: Callable[[str], None] = lambda m: None) -> BuildResult:
         t0 = time.time()
@@ -1178,7 +1301,7 @@ class NxAdapter:
         _ok, _msg = _mem_check(1200.0, 92.0, "NX")
         if not _ok:
             # 内存不够时，先把**其它** CAD 关掉（用户要求同时只开一个），
-            # 再重判一次；否则 SW 占着的 500+ MB 会让 CATIA/NX 永远起不来。
+            # 再重判一次；否则 SW 占着的 500+ MB 会让 NX 永远起不来。
             try:
                 from .guard import free_others as _free_others
                 _free_others("NX", log, fast=True)
@@ -1219,6 +1342,28 @@ class NxAdapter:
             import json as _json2
             sheet_json = _json2.dumps({"L": spec.sheet_L, "W": spec.sheet_W,
                                        "t": spec.sheet_t, "h": spec.flange_h})
+        base_profile_json = "None"
+        if getattr(spec, "base_profile", None):
+            # 通用闭合轮廓 -> [(line, p1, p2) | (arc, p1, pm, p2)]，repr 成 Python 源码。
+            # 圆弧用中点式三点，journal 侧 Curves.CreateArc 建原生圆弧。
+            import math as _math
+            from ..calc import base_outline as _base_outline
+            _bpl = []
+            for _sg in _base_outline(spec):
+                if _sg[0] == "line":
+                    _bpl.append({"type": "line",
+                                 "p1": [float(_sg[1]), float(_sg[2])],
+                                 "p2": [float(_sg[3]), float(_sg[4])]})
+                elif _sg[0] == "arc":
+                    _cx, _cy, _r, _a0, _a1 = [float(v) for v in _sg[1:6]]
+                    _bpl.append({"type": "arc",
+                                 "center": [_cx, _cy],
+                                 "p1": [_cx + _r * _math.cos(_math.radians(_a0)),
+                                        _cy + _r * _math.sin(_math.radians(_a0))],
+                                 "p2": [_cx + _r * _math.cos(_math.radians(_a1)),
+                                        _cy + _r * _math.sin(_math.radians(_a1))],
+                                 "dir": 1 if _a1 >= _a0 else -1})
+            base_profile_json = repr(_bpl)
         base_outline_json = "None"
         if (spec.base_kind == "rect"
                 and (str(getattr(spec, "end_left", "square")).lower() == "arc"
@@ -1260,6 +1405,7 @@ class NxAdapter:
                 .replace("__GEAR__", gear_json)
                 .replace("__SHEET__", sheet_json)
                 .replace("__BASE_OUTLINE__", base_outline_json)
+                .replace("__BASE_PROFILE__", base_profile_json)
                 .replace("__SWEEPS__", sweeps_json)
                 .replace("__REVOLVE__", revolve_json))
         journal.write_text(text, encoding="utf-8")
@@ -1305,7 +1451,7 @@ class NxAdapter:
             watchdog_s = float(os.environ.get("EA_NX_TIMEOUT", "240"))
             # NX journal log goes to a FILE, never to a pipe: ugraf inherits
             # handles, so a PIPEr would never reach EOF and callers would hang
-            # until NX exits (same bug fixed in catia.py).
+            # until NX exits.
             _nx_log_path = work / "nx_run.log"
             _nx_out = open(_nx_log_path, "wb")
             # UGII_BASE_DIR / UGII_ROOT_DIR 必须显式注入：缺这两个变量时
@@ -1384,7 +1530,7 @@ class NxAdapter:
                                       f"syslog 与 nx_run.log 见 {work}")
                 res.message = (self._startup_dead + "。已知诱因：Windows 11 25H2 上"
                                "NX 12 启动画面/图形宿主初始化挂起；请在 NX 图形界面里手动"
-                               "打开一次确认，或改用 SolidWorks / CATIA 后端。")
+                               "打开一次确认，或改用 SolidWorks 后端。")
                 res.details["journal_log"] = str(_nx_log_path)
                 res.details["startup_dead"] = True
                 res.unsupported = True
@@ -1426,7 +1572,7 @@ class NxAdapter:
                 res.ok = False
                 res.message = (res.message or "") + "｜未完成：" + "、".join(_failed)
             # NX 的 volume 来自 MeasureManager.NewMassProperties（实测实体），
-            # 不是理论值 —— 与 SW/CATIA 统一打标，便于上层区分。
+            # 不是理论值 —— 与 SW 统一打标，便于上层区分。
             res.details["volume_source"] = "measured"
             if data.get("sweep_built"):
                 res.details["sweep_built"] = data.get("sweep_built")

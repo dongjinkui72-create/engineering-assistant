@@ -1,4 +1,4 @@
-"""单实例闸门：同一时刻只允许一个工程软件（NX / SolidWorks / CATIA）运行。
+"""单实例闸门：同一时刻只允许一个工程软件（NX / SolidWorks）运行。
 
 用户要求：一次只能开一个 CAD、一个界面，禁止多开导致卡顿/崩溃。
 
@@ -22,33 +22,21 @@ CAD_PROCESSES = {
     # 主进程 + 会常驻占内存的辅助进程：只杀主进程时，辅助进程会拖着工作集不退，
     # 下一次建模就会在「内存闸门」上卡住，所以按家族整体关闭。
     "SolidWorks": ("SLDWORKS.exe", "sldworks_fs.exe", "SLDWORKSCommunicator.exe"),
-    # CATSysDemon 不在「必须关」的表里：它是 CATIA 的许可守护进程（约 2 MB、
-    # 无窗口），在部分机器上以管理员/SYSTEM 身份运行，普通权限 taskkill 一定
-    # 失败。把它算进硬性关闭会让每次 acquire 都报「无法关闭其它 CAD」直接卡死
-    # 建模。它不持有任何 CAD 会话，见 BEST_EFFORT。
-    "CATIA": ("CNEXT.exe", "CATIA.exe", "catstart.exe"),
     "NX": ("ugraf.exe", "run_journal.exe"),
-}
-
-# 尽力而为的辅助进程：能关就关，关不掉也不拦构建（不占 CAD 会话/界面）。
-BEST_EFFORT = {
-    "CATIA": ("CATSysDemon.exe",),
 }
 
 # 每家的「主界面进程」：同一时刻只允许 1 个。其它同名辅助进程不在此列。
 PRIMARY_PROCESS = {
     "SolidWorks": "SLDWORKS.exe",
-    "CATIA": "CNEXT.exe",
     "NX": "ugraf.exe",
 }
 
 # 已有一个主进程时怎么办：
-#   True  = 保留它，适配器用 COM 复用（SW / CATIA 走 Dispatch，不会再起第二个界面）
+#   True  = 保留它，适配器用 COM 复用（SW 走 Dispatch，不会再起第二个界面）
 #   False = 全关掉，适配器会用启动器新起一个（NX 走 run_journal，必然另开 ugraf，
 #           留着旧的就会变成两个界面）
 KEEP_ONE = {
     "SolidWorks": True,
-    "CATIA": True,
     "NX": False,
 }
 
@@ -245,21 +233,6 @@ def _sweep_others(cad: str, log: Callable[[str], None] = lambda m: None,
             total += len(pids)
         if not found:
             return total
-    # 尽力而为：许可守护进程关不掉时只记一行，不当成「第二家 CAD 在跑」
-    for other, names in BEST_EFFORT.items():
-        if other == cad:
-            continue
-        pids = _tasklist(names)
-        if not pids:
-            continue
-        for pid in pids:
-            _kill(pid, force=True)
-        rest = _tasklist(names)
-        if rest:
-            _log(log, "%s 许可守护进程仍在运行（%s，无窗口、不占 CAD 会话，忽略）"
-                 % (other, "、".join("%s(%s)" % (n, p) for p, n in rest.items())))
-        else:
-            total += len(pids)
     left = []
     for other, names in CAD_PROCESSES.items():
         if other == cad:
@@ -277,7 +250,7 @@ def free_others(cad: str, log: Callable[[str], None] = lambda m: None,
     """把**其它** CAD 关掉，并把内存还回来（不等锁、不建锁）。
 
     用途：内存闸门（memguard）在 acquire 之前就会早退，
-    此时 SolidWorks 可能还占着 500+ MB 内存，导致 CATIA 永远等不到
+    此时 SolidWorks 可能还占着 500+ MB 内存，导致 NX 永远等不到
     1200 MB 可用 —— 用户是要求「同一时刻只开一个 CAD」，
     所以闸门早期就该按这条规则先关别人，再判内存。
     fast=True 用于「内存不足、本次根本不建模」的早退分支：不等温和关闭，
@@ -345,7 +318,7 @@ def _acquire_impl(cad: str, log: Callable[[str], None] = lambda m: None,
         _log(log, "确认另外两家 CAD 均未运行（可用内存 %.0f MB）" % _ram0)
 
     # 同一家也不允许出现多个主进程：同一时刻只能有一个界面。
-    # 只对「主程序」计数，避免误杀辅助进程（CATIA 的 CATStart）。
+    # 只对「主程序」计数，避免误杀辅助进程。
     primary = PRIMARY_PROCESS.get(cad)
     if primary:
         own = _tasklist((primary,))

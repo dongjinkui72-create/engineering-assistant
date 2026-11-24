@@ -37,11 +37,12 @@ def analyze_dxf(path: str) -> PartSpec:
         if r < outer_r * 0.985:
             feats.append(Feature(type="hole", x=x - cx, y=y - cy,
                                  diameter=2 * r, through=True, depth=0.0,
-                                 note="DXF 圆"))
+                                 depth_confirmed=False,
+                                 note="DXF 圆；二维图未给出孔深，需人工确认通孔或盲孔深度"))
     spec = PartSpec(part_name=Path(path).stem, base_kind="rect",
-                    length=round(L, 2), width=round(W, 2), thickness=10.0,
+                    length=round(L, 2), width=round(W, 2), thickness=0.0,
                     features=feats, confidence=0.55, source=Path(path).name,
-                    notes="来自 DXF 的二维轮廓；厚度需人工确认（默认 10mm），型腔/槽深未体现。")
+                    notes="来自 DXF 的二维轮廓；厚度/槽深未体现，必须人工确认。")
     if abs(L - W) < 0.05 and len(circles) <= 1:
         spec.base_kind = "round"
         spec.diameter = round(L, 2)

@@ -22,6 +22,9 @@ THIN_WALL = 0.5      # 小于这个间隙就算薄壁（mm）
 
 
 def label(f) -> str:
+    if f.type == "profile_cut":
+        _n = len(getattr(f, "profile", None) or [])
+        return f"轮廓切除({_n}段)"
     if f.type == "hole":
         return f"孔Φ{f.diameter:g}@({f.x:g},{f.y:g})"
     if f.type == "slot":
@@ -33,6 +36,15 @@ def label(f) -> str:
 
 def outline(f, n: int = 180) -> List[Pt]:
     """特征轮廓的闭合多边形（绝对坐标）。"""
+    if f.type == "profile_cut":
+        try:
+            from .geom import flatten, segs_from_profile
+            _pts = flatten(segs_from_profile(getattr(f, "profile", None) or []), 2.0)
+            if _pts and len(_pts[0]) >= 3:
+                return [(float(x), float(y)) for x, y in _pts[0]]
+        except Exception:
+            pass
+        return []
     if f.type in ("hole", "sphere"):
         r = f.diameter / 2.0
         return [(f.x + r * math.cos(2 * math.pi * i / n),
@@ -155,28 +167,42 @@ def analyze(spec) -> Dict:
                  "knife": []}
     if len(feats) < 2:
         return res
+    # CAD 导入的 spec 来自真实几何，不是识图猜测：越界/贴壁/薄壁这些
+    # 「识图误读」启发式一律不适用，也绝不能写 dropped_features（否则正确
+    # 的 CAD 模型会被判未完成）。只保留「完全包含＝重复表达」的几何去重。
+    origin_cad = str(getattr(spec, "origin", "vision") or "vision").lower() == "cad"
     polys = [outline(f) for f in feats]
     depths = [_cut_depth(spec, f) for f in feats]
     skip = set()
+    # 键槽跟孔一体，不参与越界/薄壁判定（它本身就从孔壁开始）
+    idx_keep = [k for k, _f in enumerate(feats)
+                if str(getattr(_f, "type", "")).lower() != "keyway"]
 
     # ---- 0) 越出毛坯：物理上不可能存在，是识图错误的确定性证据，直接判无效
     #       （不像薄壁那样需要人判断）。必须在这里做，因为 build_features() /
-    #       part_volume_exact() / CAM 都只认 conflict 的结论，validate() 只在
+    #       part_volume_exact() / geometry 都只认 conflict 的结论，validate() 只在
     #       识图流程末尾跑一次，直调 build() 的路径会绕过它。
     ign_blank = set()
-    half_l, half_w = spec.length / 2.0, spec.width / 2.0
-    for i, f in enumerate(feats):
+    if getattr(spec, "base_profile", None):
+        _bx0, _by0, _bx1, _by1 = spec.profile_bbox()
+        _cx, _cy = (_bx0 + _bx1) / 2.0, (_by0 + _by1) / 2.0
+        half_l, half_w = (_bx1 - _bx0) / 2.0, (_by1 - _by0) / 2.0
+    else:
+        _cx, _cy = 0.0, 0.0
+        half_l, half_w = spec.length / 2.0, spec.width / 2.0
+    for i in (() if origin_cad else idx_keep):
+        f = feats[i]
         if f.type == "hole":
             rx = ry = f.diameter / 2.0
         else:
             rx = max(f.length, f.width or 0.0) / 2.0
             ry = (f.width or f.length) / 2.0
-        over_x = abs(f.x) + rx - half_l
-        over_y = abs(f.y) + ry - half_w
+        over_x = abs(f.x - _cx) + rx - half_l
+        over_y = abs(f.y - _cy) + ry - half_w
         if spec.base_kind == "round":
             over = (f.x ** 2 + f.y ** 2) ** 0.5 + max(rx, ry) - spec.diameter / 2.0
             over_x = over_y = over
-        # 与毛坯等大（或更大）的 step/pocket：切掉等于整块去掉，CATIA 会直接
+        # 与毛坯等大（或更大）的 step/pocket：切掉等于整块去掉，NX 会直接
         # "方法 Update 失败"，是识图把整个外形当成了台阶/型腔。
         if f.type in ("step", "pocket") and spec.base_kind == "rect":
             if (f.length >= spec.length - 0.5) and (f.width >= spec.width - 0.5):
@@ -202,10 +228,12 @@ def analyze(spec) -> Dict:
                     spec.dropped_features.append(msg)
             except AttributeError:
                 pass
-    for i in range(len(feats)):
+    for i in idx_keep:
         if i in skip:
             continue
-        for j in range(i + 1, len(feats)):
+        for j in idx_keep:
+            if j <= i:
+                continue
             if j in skip:
                 continue
             pi, pj = polys[i], polys[j]
@@ -237,7 +265,7 @@ def analyze(spec) -> Dict:
             if gap < THIN_WALL:
                 small, big = (i, j) if _span(pi) <= _span(pj) else (j, i)
                 res["thin"].append((small, big, gap))
-                if feats[small].type in ("hole", "slot"):
+                if feats[small].type in ("hole", "slot") and not origin_cad:
                     grow = round(gap + 0.1, 3)
                     res["grow"][small] = max(res["grow"].get(small, 0.0), grow)
                     res["warnings"].append(
@@ -259,7 +287,7 @@ def analyze(spec) -> Dict:
         # 像"台阶的侧壁压在已切通的槽里"（0.00mm 但不是孔）、或 0.2mm 薄壁，
         # 都是图纸上真实可能存在、CAD 也可能切得出来的，只告警不剔除——
         # 真切不出来会进 BuildResult.failures，门禁照样红，不会静默。
-        if not (feats[small].type == "hole" and kn <= 0.01):
+        if origin_cad or not (feats[small].type == "hole" and kn <= 0.01):
             res["warnings"].append(
                 f"特征 {label(feats[small])} 与 {label(feats[big])} 的壁面几乎相接"
                 f"（{kn:.2f}mm），可能产生尖角，先按原图切，切不出来会记进失败清单")

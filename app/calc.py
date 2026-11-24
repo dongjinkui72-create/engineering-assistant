@@ -4,7 +4,9 @@ from __future__ import annotations
 import math
 from typing import List, Tuple
 
-from .geom import Seg, circle, flatten, outline_area, rect_outline, slot_outline
+from .geom import (Seg, circle, flatten, outline_area, outline_area_exact,
+                   rect_outline, segs_from_profile, segs_perimeter,
+                   slot_outline)
 from .models import Feature, PartSpec
 
 
@@ -15,6 +17,9 @@ def _x_base_area_legacy(spec: PartSpec) -> float:
 
 
 def base_outline(spec: PartSpec) -> List[Seg]:
+    bp = getattr(spec, "base_profile", None)
+    if bp:
+        return segs_from_profile(bp)
     if spec.base_kind == "round":
         return circle(0.0, 0.0, spec.diameter / 2.0)
     left = str(getattr(spec, "end_left", "square") or "square").lower()
@@ -43,7 +48,7 @@ def base_outline(spec: PartSpec) -> List[Seg]:
 def offset_outline(spec: PartSpec, d: float) -> List[Seg]:
     """外轮廓法向偏置 d（mm，d>0 外扩，d<0 内缩），保留原生圆弧。
 
-    CAM 刀心轨迹、抽壳内腔都用它：不把圆弧拆成一串点。
+    geometry 刀心轨迹、抽壳内腔都用它：不把圆弧拆成一串点。
     """
     d = float(d)
     if spec.base_kind == "round":
@@ -108,6 +113,9 @@ def inner_outline(spec: PartSpec, t: float) -> List[Seg]:
 
 
 def base_area(spec: PartSpec) -> float:
+    bp = getattr(spec, "base_profile", None)
+    if bp:
+        return outline_area_exact(segs_from_profile(bp))
     if spec.base_kind == "round":
         return math.pi * (spec.diameter / 2.0) ** 2
     left = str(getattr(spec, "end_left", "square") or "square").lower()
@@ -122,6 +130,8 @@ def base_area(spec: PartSpec) -> float:
 
 def feature_outline(f: Feature, grow: float = 0.0) -> List[Seg]:
     """grow：薄壁冲突时把孔外扩的量（见 app/conflict.py），保证理论体积与 CAD 一致。"""
+    if f.type == "profile_cut":
+        return segs_from_profile(f.profile)
     if f.type == "hole":
         return circle(f.x, f.y, f.diameter / 2.0 + grow)
     if f.type == "slot":
@@ -132,6 +142,31 @@ def feature_outline(f: Feature, grow: float = 0.0) -> List[Seg]:
     return rect_outline(f.length + 2 * grow, f.width + 2 * grow, f.corner_radius, f.x, f.y)
 
 
+def round_slot_band_area(spec, f) -> float:
+    """圆盘上**横贯全径**的直槽截面积（槽两端被外圆裁掉，不是腰形两端半圆）。
+
+    十字节 Ø90×36：18 宽槽铣穿整个盘面，CAD 里用一个两端伸出盘外的方块切。
+    截面积是圆被两条平行弦切出的弓形带，不是弦长×槽宽：
+
+        A = 2·[ a·√(R²−a²) + R²·asin(a/R) ],  a = W/2
+
+    对 R=45、W=18 解得 1609.13；旧式 2·W·√(R²−(W/2)²) 只给 1587.27，
+    少算 21.9 mm²，体积高估约 0.36%。
+    返回 0 表示"长度不足以横贯全径"，走普通腰形公式。
+    """
+    if str(getattr(spec, "base_kind", "")) != "round":
+        return 0.0
+    R = float(spec.diameter or 0.0) / 2.0
+    w = float(f.width or 0.0)
+    if R <= 0 or w <= 0 or w >= 2.0 * R:
+        return 0.0
+    half_chord = math.sqrt(max(R * R - (w / 2.0) ** 2, 0.0))
+    if float(getattr(f, "length", 0.0) or 0.0) < 2.0 * half_chord - 1e-6:
+        return 0.0
+    a = w / 2.0
+    return 2.0 * (a * half_chord + R * R * math.asin(min(a / R, 1.0)))
+
+
 def sphere_cap_volume(R: float, h: float) -> float:
     """球冠体积：h 为切深（≤R 时是球冠，>R 时按半球算）。"""
     h = min(max(h, 0.0), R)
@@ -139,6 +174,8 @@ def sphere_cap_volume(R: float, h: float) -> float:
 
 
 def feature_area(f: Feature, grow: float = 0.0) -> float:
+    if f.type == "profile_cut":
+        return outline_area_exact(segs_from_profile(f.profile))
     if f.type == "sphere":
         # 球坑按"最大截面圆"参与面积统计（体积另有解析式，见 part_volume_exact）
         r = f.diameter / 2.0
@@ -153,7 +190,7 @@ def feature_area(f: Feature, grow: float = 0.0) -> float:
 
 
 def feature_depth(spec: PartSpec, f: Feature) -> float:
-    """通/盲统一用 Feature.is_through()（深度优先），避免 CAD 切通、CAM 钻盲两套口径。"""
+    """通/盲统一用 Feature.is_through()（深度优先），避免 CAD 切通、geometry 钻盲两套口径。"""
     try:
         through = f.is_through()
     except Exception:
@@ -182,7 +219,39 @@ def _mask(poly, X, Y):
     return inside
 
 
+def _pt_in_poly(pt, poly, tol=1e-6) -> bool:
+    """点是否落在多边形内或边界上（射线法 + 边界距离容差）。"""
+    x, y = pt
+    inside = False
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        # 到线段的距离
+        dx, dy = xj - xi, yj - yi
+        _l2 = dx * dx + dy * dy
+        if _l2 > 0.0:
+            t = max(0.0, min(1.0, ((x - xi) * dx + (y - yi) * dy) / _l2))
+        else:
+            t = 0.0
+        px, py = xi + t * dx, yi + t * dy
+        if (x - px) ** 2 + (y - py) ** 2 <= tol * tol:
+            return True
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-12) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _poly_all_inside(outer, inner, tol=1e-6) -> bool:
+    return all(_pt_in_poly(pt, outer, tol) for pt in inner)
+
+
 def perimeter(spec: PartSpec) -> float:
+    bp = getattr(spec, "base_profile", None)
+    if bp:
+        return segs_perimeter(segs_from_profile(bp))
     if spec.base_kind == "round":
         return math.pi * spec.diameter
     left = str(getattr(spec, "end_left", "square") or "square").lower()
@@ -280,7 +349,7 @@ def edge_feature_volume(spec: PartSpec) -> float:
 
     倒角：精确式；圆角：标称式（各内核角部过渡略有差别）。
     两个分量已抽成模块级 chamfer_v / fillet_v，
-    供 CAM 回灌按“有无对应工序”分别判定。
+    供 geometry 回灌按“有无对应工序”分别判定。
     """
     c = float(spec.chamfer or 0.0)
     f = fillet_effective(spec)
@@ -1160,7 +1229,7 @@ def xz_offset_segments(segs, d: float) -> list:
 
     球头刀刀心必须走偏置面，刀面才与理论曲面相切；平底刀走同一路会留下一整圈台阶。
     单独的线段偏置会在直线-圆弧相切/折角处留下 0.1~0.2mm 的 Z 台阶，
-    NC 从台阶低点继续走下一段会把整条直线拉成斜线（实测浅弧过切 1.44%）。
+    CAD 从台阶低点继续走下一段会把整条直线拉成斜线（实测浅弧过切 1.44%）。
     相邻段的交点在这里用解析求交修剪，刀路仍是原生 G01/G02/G03。
     """
     out = []
@@ -1381,10 +1450,15 @@ def revolve_centroid(spec: PartSpec):
         a, b = _rev_seg_moment(seg)
         i2 += a
         i2z += b
-    v = abs(math.pi * i2)
-    if v <= 1e-9:
+    # 闭合母线的绕向由图纸/识图决定，可能是顺时针也可能是逆时针。
+    # ∫r²dz 与 ∫z·r²dz 会同时变号；这里先把两者统一到正体积方向，
+    # 否则质心 z 会被 abs() 单独翻错（p14 实测 −21.43，正确 +21.43）。
+    if abs(i2) <= 1e-12:
         return None
-    zc = (math.pi * i2z) / v
+    if i2 < 0.0:
+        i2 = -i2
+        i2z = -i2z
+    zc = i2z / i2
     return (0.0, 0.0, zc)
 
 
@@ -1501,10 +1575,10 @@ def dome_cut_overlap_volume(spec: PartSpec) -> float:
                 g = spec.grow_of(f)
             except Exception:
                 g = 0.0
-            sel = _feature_mask(f, X, Y, g)
+            sel = _feature_mask(f, X, Y, g, spec)
             if f.type == "hole" and f.counterbore_depth > 0 and f.counterbore_dia > f.diameter:
                 cb = Feature(type="hole", x=f.x, y=f.y, diameter=f.counterbore_dia)
-                sel = sel | _feature_mask(cb, X, Y)
+                sel = sel | _feature_mask(cb, X, Y, spec=spec)
         else:
             continue
         cut |= sel
@@ -1526,10 +1600,16 @@ def shaft_volume(spec: PartSpec) -> float:
     return v
 
 
-def _feature_mask(f, X, Y, grow: float = 0.0):
+def _feature_mask(f, X, Y, grow: float = 0.0, spec: PartSpec | None = None):
     """特征轮廓的解析掩膜（向量化）。比 _mask(flatten(...)) 快两个数量级，
     而且没有弦近似误差（原来 1.5° 离散还会让面积偏 0.02%）。"""
     import numpy as np
+    if f.type == "profile_cut":
+        # 任意闭合直线/圆弧轮廓：按 1.5° 弦离散做点在多边形内判定。
+        # 只用于数值积分掩膜；CAD 侧始终用原生 line/arc 建曲线。
+        _poly = flatten(segs_from_profile(f.profile), 1.5)
+        _m = _polys_mask(X, Y, _poly) if _poly else None
+        return _m if _m is not None else np.zeros(X.shape, bool)
     if f.type == "hole":
         r = f.diameter / 2.0 + grow
         return (X - f.x) ** 2 + (Y - f.y) ** 2 <= r * r
@@ -1541,6 +1621,12 @@ def _feature_mask(f, X, Y, grow: float = 0.0):
         dx, dy = X - f.x, Y - f.y
         u = dx * ca + dy * sa
         v = -dx * sa + dy * ca
+        # ????????????????????????
+        # ???? p28 ? 18 ?????????? 2.4%?
+        # ????????? 0.6%????????????????
+        # ???????????????
+        if spec is not None and round_slot_band_area(spec, f) > 0.0:
+            return (np.abs(u) <= L / 2.0) & (np.abs(v) <= W / 2.0)
         half = max(0.0, (L - W) / 2.0)
         uu = np.clip(u, -half, half)
         return (u - uu) ** 2 + v * v <= (W / 2.0) ** 2
@@ -1576,7 +1662,18 @@ def _grid(spec: PartSpec, step: float):
         n = int(math.ceil((half + step) / step))
         return (np.arange(2 * n, dtype=float) + 0.5 - n) * step
 
-    if spec.base_kind == "round":
+    if getattr(spec, "base_profile", None):
+        _x0, _y0, _x1, _y1 = spec.profile_bbox()
+        xs = np.arange(math.floor((_x0 - step) / step) * step + step / 2.0,
+                       _x1 + step, step)
+        ys = np.arange(math.floor((_y0 - step) / step) * step + step / 2.0,
+                       _y1 + step, step)
+        X, Y = np.meshgrid(xs, ys)
+        _poly = flatten(segs_from_profile(spec.base_profile), 1.5)
+        base = _polys_mask(X, Y, _poly)
+        if base is None:
+            base = np.zeros(X.shape, bool)
+    elif spec.base_kind == "round":
         r = spec.diameter / 2.0
         xs = _centers(r)
         X, Y = np.meshgrid(xs, xs)
@@ -1599,8 +1696,14 @@ def _grid(spec: PartSpec, step: float):
                 base |= ((X + _xi) ** 2 + Y ** 2 <= _hw ** 2) & (X <= -_xi)
             if _r == "arc":
                 base |= ((X - _xi) ** 2 + Y ** 2 <= _hw ** 2) & (X >= _xi)
-    depth = np.zeros(X.shape, dtype=float)
+    # 顶面切除深度 / 底面切除深度分开累计。face=bottom 的特征（十字节正反两条槽）
+    # 从底面往上切，若也记到 top 里，两条槽在中心相交处只会扣一次深度，
+    # 理论体积会系统性偏大（Ø90×36 十字节实测 +4.5%）。材料区间是
+    # [bot, T-top]，两边都切穿时自动截零。
+    top = np.zeros(X.shape, dtype=float)
+    bot = np.zeros(X.shape, dtype=float)
     for f in spec.build_features():          # 重复轮廓已剔除，薄壁孔按外扩算
+        _fb = str(getattr(f, "face", "top") or "top").lower() == "bottom"
         if f.type == "sphere":
             # 球坑：半径 R 的球心在顶面上方 (R-h) 处，削出高 h 的球冠。
             # 逐格切深 depth(r) = h - R + sqrt(R^2 - r^2)：r=0 时等于 h，
@@ -1612,18 +1715,34 @@ def _grid(spec: PartSpec, step: float):
             if R > 0.0 and h > 0.0:
                 rr2 = (X - f.x) ** 2 + (Y - f.y) ** 2
                 z_off = np.sqrt(np.maximum(R * R - rr2, 0.0))
-                depth = np.maximum(depth, np.maximum(h - R + z_off, 0.0))
+                top = np.maximum(top, np.maximum(h - R + z_off, 0.0))
             continue
-        if f.type in ("hole", "pocket", "slot", "step"):
+        if f.type in ("hole", "pocket", "slot", "step", "profile_cut"):
             d = float(feature_depth(spec, f))
             g = spec.grow_of(f)
-            m = _feature_mask(f, X, Y, g)
-            depth[m] = np.maximum(depth[m], d)
+            m = _feature_mask(f, X, Y, g, spec)
+            tgt = bot if _fb else top
+            tgt[m] = np.maximum(tgt[m], d)
             if f.type == "hole" and f.counterbore_depth > 0 and f.counterbore_dia > f.diameter:
                 cb = Feature(type="hole", x=f.x, y=f.y, diameter=f.counterbore_dia)
-                m2 = _feature_mask(cb, X, Y)
-                depth[m2] = np.maximum(depth[m2], f.counterbore_depth)
-    return X, Y, base, depth
+                m2 = _feature_mask(cb, X, Y, spec=spec)
+                tgt[m2] = np.maximum(tgt[m2], f.counterbore_depth)
+    return X, Y, base, top, bot
+
+
+def _grid_depth(spec: PartSpec, step: float):
+    """栅格体积/质心共用：返回 (X, Y, base, lo, hi)。
+
+    lo/hi 是每根柱上**剩余材料**的 z 区间（[lo, hi]），底面切除抬 lo、
+    顶面切除降 hi；两者相交时厚度自动截零。旧版只返回顶面深度，
+    face=bottom 的特征会被静默按顶面处理。
+    """
+    import numpy as np
+    X, Y, base, top, bot = _grid(spec, step)
+    T = float(spec.thickness)
+    lo = np.clip(bot, 0.0, T)
+    hi = np.maximum(T - np.clip(top, 0.0, T), lo)
+    return X, Y, base, lo, hi
 
 
 def _rect_area(l: float, w: float, r: float = 0.0) -> float:
@@ -1687,6 +1806,117 @@ def _shell_scope_of_circle(spec: PartSpec, f: Feature, r: float, t: float):
     return _shell_scope_poly(_ol(ring, 48), polys[0])
 
 
+def keyway_volume(f, spec):
+    """键槽（非轴对称）扣除体积。
+
+    截面：孔半径 r、键槽宽 w、径向深 d（从孔壁量起），
+    A = w*(r+d) - [ b*sqrt(r^2-b^2) + r^2*asin(b/r) ],  b = w/2
+    轴向长度 L 取特征的 length，缺省用 spec.thickness。
+    """
+    r = float(getattr(f, "diameter", 0.0) or 0.0) / 2.0
+    if r <= 0:
+        r = float(getattr(spec, "bore", 0.0) or 0.0) / 2.0
+    w = float(getattr(f, "width", 0.0) or 0.0)
+    d = float(getattr(f, "depth", 0.0) or 0.0)
+    L = float(getattr(f, "length", 0.0) or 0.0)
+    if L <= 0:
+        L = float(getattr(spec, "thickness", 0.0) or 0.0)
+    if r <= 0 or w <= 0 or d <= 0 or L <= 0:
+        return 0.0
+    b = w / 2.0
+    if b >= r:
+        area = w * d
+    else:
+        area = w * (r + d) - (b * math.sqrt(r * r - b * b)
+                              + r * r * math.asin(b / r))
+    return max(area, 0.0) * L
+
+
+def _round_cross_slot_exact(spec: PartSpec, feats):
+    """?? + ???? + ??????????
+
+    p28 ?????90?36??? ?32 ????/???? 18 ??? 14 ?
+    ???????????????????????????
+    ???????????? ? ???????????? Z
+    ????????????????????????????
+    None??????????
+    """
+    if str(getattr(spec, "base_kind", "")) != "round":
+        return None
+    T = float(getattr(spec, "thickness", 0.0) or 0.0)
+    R = float(getattr(spec, "diameter", 0.0) or 0.0) / 2.0
+    if T <= 0.0 or R <= 0.0:
+        return None
+    if (float(getattr(spec, "shell_t", 0.0) or 0.0) > 0.0
+            or float(getattr(spec, "dome_h", 0.0) or 0.0) > 0.0
+            or float(getattr(spec, "fillet", 0.0) or 0.0) > 0.0
+            or float(getattr(spec, "chamfer", 0.0) or 0.0) > 0.0
+            or getattr(spec, "sweep_profile", None)):
+        return None
+
+    holes = [f for f in feats if f.type == "hole"]
+    slots = [f for f in feats if f.type == "slot"]
+    if len(feats) != len(holes) + len(slots) or len(holes) != 1 or not slots:
+        return None
+    hf = holes[0]
+    rh = float(hf.diameter or 0.0) / 2.0
+    if (rh <= 0.0 or abs(float(hf.x or 0.0)) > 1e-6
+            or abs(float(hf.y or 0.0)) > 1e-6 or not hf.is_through()):
+        return None
+    try:
+        if spec.grow_of(hf) > 1e-9:
+            return None
+    except Exception:
+        pass
+
+    intervals = []
+    v = math.pi * R * R * T - math.pi * rh * rh * T
+    for f in slots:
+        if abs(float(f.x or 0.0)) > 1e-6 or abs(float(f.y or 0.0)) > 1e-6:
+            return None
+        band = round_slot_band_area(spec, f)
+        d = float(feature_depth(spec, f))
+        if band <= 0.0 or d <= 0.0 or d > T + 1e-9:
+            return None
+        try:
+            if spec.grow_of(f) > 1e-9:
+                return None
+        except Exception:
+            pass
+        a = float(f.width or 0.0) / 2.0
+        if a >= rh:
+            overlap = math.pi * rh * rh
+        else:
+            overlap = 2.0 * (a * math.sqrt(max(rh * rh - a * a, 0.0))
+                             + rh * rh * math.asin(min(1.0, a / rh)))
+        is_bottom = str(getattr(f, "face", "top") or "top").lower() == "bottom"
+        z0, z1 = (0.0, d) if is_bottom else (T - d, T)
+        for a0, a1 in intervals:
+            if max(z0, a0) < min(z1, a1) - 1e-9:
+                return None
+        intervals.append((z0, z1))
+        v -= max(band - overlap, 0.0) * d
+    return max(v, 0.0)
+
+
+def feature_bbox(f: Feature):
+    """特征 XY 包围盒 (x0,y0,x1,y1)。profile_cut 用真实轮廓（含圆弧极值）。"""
+    if f.type == "profile_cut":
+        try:
+            from .geom import segs_bbox
+            bb = segs_bbox(segs_from_profile(f.profile))
+            if bb[2] - bb[0] > 1e-9 and bb[3] - bb[1] > 1e-9:
+                return bb
+        except Exception:
+            pass
+    if f.type in ("hole", "sphere"):
+        r = f.diameter / 2.0
+        return (f.x - r, f.y - r, f.x + r, f.y + r)
+    rx = max(f.length, f.width or 0.0) / 2.0
+    ry = (f.width or f.length) / 2.0
+    return (f.x - rx, f.y - ry, f.x + rx, f.y + ry)
+
+
 def part_volume_exact(spec: PartSpec):
     """解析体积；算不了（特征互相交叠 / 有凸台 / 超出覆盖范围）时返回 None。
 
@@ -1700,26 +1930,96 @@ def part_volume_exact(spec: PartSpec):
             return sheet_volume(spec.sheet_L, spec.sheet_W, spec.sheet_t, spec.flange_h)
         if spec.teeth > 0 and spec.module > 0:
             from .gear import gear_volume
+            _gh = []
+            for _f in (getattr(spec, "features", None) or []):
+                try:
+                    if str(getattr(_f, "type", "")).lower() == "hole" and float(getattr(_f, "diameter", 0) or 0) > 0:
+                        _gh.append({"diameter": float(_f.diameter),
+                                    "depth": float(getattr(_f, "depth", 0) or 0),
+                                    "x": float(getattr(_f, "x", 0) or 0),
+                                    "y": float(getattr(_f, "y", 0) or 0)})
+                except Exception:
+                    pass
             return gear_volume(spec.module, spec.teeth, spec.face_width,
-                               bore=spec.bore, keyway_w=spec.keyway_w, keyway_d=spec.keyway_d)
+                               bore=spec.bore, keyway_w=spec.keyway_w, keyway_d=spec.keyway_d,
+                               hub_dia=spec.hub_dia, hub_len=spec.hub_len,
+                               bore_depth=spec.bore_depth, small_bore=spec.small_bore,
+                               chamfer=spec.chamfer, extra_holes=_gh)
         if spec.shaft_segments:
             v = 0.0
+            total = 0.0
             for s in spec.shaft_segments:
                 d = float(s.get("dia") or 0)
-                v += math.pi * (d / 2.0) ** 2 * float(s.get("length") or 0)
-            return v
+                ln = float(s.get("length") or 0)
+                total += ln
+                v += math.pi * (d / 2.0) ** 2 * ln
+            for _f in (getattr(spec, "features", None) or []):
+                try:
+                    _t = str(getattr(_f, "type", "")).lower()
+                    if _t == "keyway":
+                        v -= max(float(_f.width or 0), 0.0) * max(float(_f.depth or 0), 0.0) * max(float(_f.length or 0), 0.0)
+                    elif _t == "hole" and str(getattr(_f, "face", "")).lower() == "right":
+                        _d = float(getattr(_f, "diameter", 0) or 0)
+                        _dep = float(getattr(_f, "depth", 0) or 0)
+                        v -= math.pi * (_d / 2.0) ** 2 * (total if _dep <= 0 else min(_dep, total))
+                except Exception:
+                    pass
+            return max(v, 0.0)
         if getattr(spec, "revolve_profile", None):
-            # 通用回转基体本身就是完整实体（母线闭合）。其特征语义未定义
-            # （孔/腔在曲面上怎么切要按件定义），有特征时如实退回 None。
-            if spec.features:
+            # 回转体：键槽 / 中心孔 / 端面贯通直槽（联轴器十字槽）可解析扣除；
+            # 其它非轴对称特征仍如实退回栅格法。
+            _rv = revolve_volume(spec) or 0.0
+            _prof = [x for x in (spec.revolve_profile or []) if isinstance(x, dict)]
+            _rs = []
+            for _sg in _prof:
+                for _k in ("p1", "p2"):
+                    _q = _sg.get(_k)
+                    if isinstance(_q, (list, tuple)) and len(_q) >= 2:
+                        _rs.append(float(_q[0]))
+            _Rmax = max(_rs) if _rs else spec.diameter / 2.0
+            _Rin = (float(getattr(spec, "bore", 0.0) or 0.0) / 2.0) or (
+                min([r for r in _rs if r > 1e-6] or [0.0]))
+            _T = float(spec.thickness or 0.0)
+
+            def _slice(Rad, a):
+                """圆盘 |x|<=a 那一带的面积（含两侧）。"""
+                a = max(0.0, min(a, Rad))
+                return 2.0 * (a * math.sqrt(max(Rad * Rad - a * a, 0.0))
+                              + Rad * Rad * math.asin(min(1.0, a / Rad)))
+
+            for _f in spec.features:
+                _t = str(getattr(_f, "type", "")).lower()
+                if _t == "keyway":
+                    _rv -= keyway_volume(_f, spec)
+                    continue
+                _d = min(feature_depth(spec, _f), _T)
+                if _t == "hole" and abs(_f.x) < 1e-6 and abs(_f.y) < 1e-6:
+                    _rv -= math.pi * (_f.diameter / 2.0) ** 2 * _d
+                    continue
+                if (_t in ("step", "pocket") and abs(_f.x) < 1e-6
+                        and abs(_f.y) < 1e-6 and _f.length >= 2.0 * _Rmax - 1e-6
+                        and 0.0 < _f.width < 2.0 * _Rmax):
+                    # 端面贯通直槽：宽 width、径向量 length，从端面切深 d
+                    _a = _f.width / 2.0
+                    _rv -= max(_slice(_Rmax, _a) - _slice(_Rin, _a), 0.0) * _d
+                    continue
                 return None
-            return revolve_volume(spec)
+            # 回转体同样要扣顶棱圆角/倒角：建模侧 SW/NX 都会在回转实体上
+            # 施加 spec.fillet（两者同时给出时倒角被圆角覆盖，见 sw.py/nx.py 的
+            # 「倒角被覆盖，跳过」分支）。此前这里只扣了特征，expected 系统性偏大。
+            # 实测 p14 限位器（Ø76.5 回转 + R2）：理论 55,617.4 / CAD 55,413.5，
+            # 差值 203.9 与 fillet_v=206.3 同量级；扣掉后 0.004%。
+            _efv = fillet_v(spec) if float(getattr(spec, 'fillet', 0.0) or 0.0) > 0 else chamfer_v(spec)
+            return max(_rv - _efv, 0.0)
         # 圆顶面上的切除：基体按平板算，再整体加圆顶体积，最后把落在
         # 特征轮廓内的圆顶材料扣掉（dome_cut_overlap_volume，与回灌侧
         # verify._expected_top 同一顶面模型）。这样 dome+球坑/孔/腔
         # 不再被迫退回栅格，避免 0.1mm 网格边界半个单元格带来的 0.5% 假差。
         T = spec.thickness
         feats = spec.build_features()
+        _cross = _round_cross_slot_exact(spec, feats)
+        if _cross is not None:
+            return _cross
         _sh = float(getattr(spec, "shell_t", 0.0) or 0.0)
         if any(f.type == "boss" for f in feats):
             return None
@@ -1727,13 +2027,36 @@ def part_volume_exact(spec: PartSpec):
             R = spec.diameter / 2.0
             base = math.pi * R * R * T
             for f in feats:
+                if round_slot_band_area(spec, f) > 0:
+                    continue          # 横贯全径的直槽，两端本来就在圆外
                 rr = (f.diameter / 2.0) if f.type == "hole" else max(f.length, f.width) / 2.0
                 if math.hypot(f.x, f.y) + rr > R + 1e-6:
+                    return None
+        elif getattr(spec, "base_profile", None):
+            base = base_area(spec) * T
+            _bx0, _by0, _bx1, _by1 = spec.profile_bbox()
+            _base_poly = flatten(segs_from_profile(spec.base_profile), arc_step_deg=1.5)[0]
+            for f in feats:
+                _fx0, _fy0, _fx1, _fy1 = feature_bbox(f)
+                if (_fx0 < _bx0 - 1e-6 or _fy0 < _by0 - 1e-6
+                        or _fx1 > _bx1 + 1e-6 or _fy1 > _by1 + 1e-6):
+                    return None
+                # 包围盒在基体内不代表轮廓在基体内：凹轮廓（缺口、内凹圆弧）
+                # 里，特征可能一部分落在空气上。解析式只会整块相减，
+                # 这种情形如实退回栅格法，由真实材料判定，绝不重复/超额扣体积。
+                _fpts = flatten(feature_outline(f), arc_step_deg=1.5)[0]
+                if not _poly_all_inside(_base_poly, _fpts, 1e-4):
                     return None
         else:
             base = base_area(spec) * T
             hl, hw = spec.length / 2.0, spec.width / 2.0
             for f in feats:
+                if f.type == "profile_cut":
+                    _fx0, _fy0, _fx1, _fy1 = feature_bbox(f)
+                    if (_fx0 < -hl - 1e-6 or _fx1 > hl + 1e-6
+                            or _fy0 < -hw - 1e-6 or _fy1 > hw + 1e-6):
+                        return None
+                    continue
                 rx = (f.diameter / 2.0) if f.type == "hole" else max(f.length, f.width) / 2.0
                 ry = (f.diameter / 2.0) if f.type == "hole" else (f.width or f.length) / 2.0
                 if abs(f.x) + rx > hl + 1e-6 or abs(f.y) + ry > hw + 1e-6:
@@ -1756,12 +2079,23 @@ def part_volume_exact(spec: PartSpec):
                 return None
         # 特征之间若有交叠/包含，面积不能直接相加（会重复扣）→ 退回栅格法
         if len(feats) > 1:
-            from .conflict import gap_between, outline as _ol
-            polys = [_ol(f, 48) for f in feats]
-            for i in range(len(feats)):
-                for j in range(i + 1, len(feats)):
-                    if gap_between(polys[i], polys[j]) < 0:
-                        return None
+            if any(f.type == "profile_cut" for f in feats):
+                # 任意轮廓的解析裁剪未实现：只保证互不重叠时可直接相加；
+                # 包围盒一旦相交就如实退回栅格法，绝不重复扣体积。
+                for i in range(len(feats)):
+                    bi = feature_bbox(feats[i])
+                    for j in range(i + 1, len(feats)):
+                        bj = feature_bbox(feats[j])
+                        if (min(bi[2], bj[2]) - max(bi[0], bj[0]) > 1e-6
+                                and min(bi[3], bj[3]) - max(bi[1], bj[1]) > 1e-6):
+                            return None
+            else:
+                from .conflict import gap_between, outline as _ol
+                polys = [_ol(f, 48) for f in feats]
+                for i in range(len(feats)):
+                    for j in range(i + 1, len(feats)):
+                        if gap_between(polys[i], polys[j]) < 0:
+                            return None
         v = base
 
         def _ded(dd, scope):
@@ -1781,8 +2115,12 @@ def part_volume_exact(spec: PartSpec):
             if f.type == "hole":
                 a = math.pi * (f.diameter / 2.0) ** 2
             elif f.type == "slot":
-                w = f.width or f.diameter
-                a = (max(f.length, w) - w) * w + math.pi * (w / 2.0) ** 2
+                a = round_slot_band_area(spec, f)
+                if a <= 0.0:
+                    w = f.width or f.diameter
+                    a = (max(f.length, w) - w) * w + math.pi * (w / 2.0) ** 2
+            elif f.type == "profile_cut":
+                a = feature_area(f)
             else:
                 a = _rect_area(f.length, f.width, f.corner_radius)
             v -= a * _ded(d, _scope)
@@ -1857,14 +2195,16 @@ def part_volume_grid(spec: PartSpec, step: float = 0.1) -> float:
     if spec.teeth > 0 and spec.module > 0:
         from .gear import gear_volume
         return gear_volume(spec.module, spec.teeth, spec.face_width,
-                           bore=spec.bore, keyway_w=spec.keyway_w, keyway_d=spec.keyway_d)
+                           bore=spec.bore, keyway_w=spec.keyway_w, keyway_d=spec.keyway_d,
+                           hub_dia=spec.hub_dia, hub_len=spec.hub_len,
+                           bore_depth=spec.bore_depth, small_bore=spec.small_bore, chamfer=spec.chamfer)
     if spec.shaft_segments:
         return shaft_volume(spec)
     if getattr(spec, "revolve_profile", None):
         # 通用回转体：XY 栅格表达不了变半径母线，解析值严格更好。
         return revolve_volume(spec) or 0.0
-    X, Y, base, depth = _grid(spec, step)
-    height = np.clip(spec.thickness - depth, 0.0, spec.thickness)
+    X, Y, base, _lo, _hi = _grid_depth(spec, step)
+    height = np.maximum(_hi - _lo, 0.0)
     _sh = float(getattr(spec, "shell_t", 0.0) or 0.0)
     if _sh > 0:
         # 抽壳：内腔区域剩余材料只剩底/壁那一层（闭合两层合计 T-cav）
@@ -1898,11 +2238,13 @@ def _part_volume_grid_impl(spec: PartSpec, step: float = 0.1) -> float:
     if spec.teeth > 0 and spec.module > 0:
         from .gear import gear_volume
         return gear_volume(spec.module, spec.teeth, spec.face_width,
-                           bore=spec.bore, keyway_w=spec.keyway_w, keyway_d=spec.keyway_d)
+                           bore=spec.bore, keyway_w=spec.keyway_w, keyway_d=spec.keyway_d,
+                           hub_dia=spec.hub_dia, hub_len=spec.hub_len,
+                           bore_depth=spec.bore_depth, small_bore=spec.small_bore, chamfer=spec.chamfer)
     if spec.shaft_segments:
         return shaft_volume(spec)
-    X, Y, base, depth = _grid(spec, step)
-    height = np.clip(spec.thickness - depth, 0.0, spec.thickness)
+    X, Y, base, _lo, _hi = _grid_depth(spec, step)
+    height = np.maximum(_hi - _lo, 0.0)
     # 单元面积要用真实 dx*dy：xs 是 linspace(-L, L, nx)，dx 不总等于 step
     # （step=0.05 时 dx/step=0.99983，用 step*step 会让面积差 0.035%，体积回升）
     dx = float(X[0, 1] - X[0, 0]) if X.shape[1] > 1 else step
@@ -1922,7 +2264,47 @@ def centroid(spec: PartSpec, step: float = 0.1):
     if getattr(spec, "revolve_profile", None):
         c = revolve_centroid(spec)
         if c is not None:
-            return c
+            # 母线只描述轴对称本体；键槽 / 中心孔 / 端面贯通直槽都会把质心往
+            # 深处拉。不扣的话实测质心与理论差 0.78mm（半联轴器 18×12 端面槽）。
+            T = float(spec.thickness or 0.0)
+            _rs = []
+            for _sg in (spec.revolve_profile or []):
+                if not isinstance(_sg, dict):
+                    continue
+                for _k in ("p1", "p2"):
+                    _q = _sg.get(_k)
+                    if isinstance(_q, (list, tuple)) and len(_q) >= 2:
+                        _rs.append(float(_q[0]))
+            _Rmax = max(_rs) if _rs else spec.diameter / 2.0
+            _Rin = (float(getattr(spec, "bore", 0.0) or 0.0) / 2.0) or (
+                min([r for r in _rs if r > 1e-6] or [0.0]))
+
+            def _slice(Rad, a):
+                a = max(0.0, min(a, Rad))
+                return 2.0 * (a * math.sqrt(max(Rad * Rad - a * a, 0.0))
+                              + Rad * Rad * math.asin(min(1.0, a / Rad)))
+
+            num, den = (revolve_volume(spec) or 0.0) * float(c[2]), \
+                (revolve_volume(spec) or 0.0)
+            for _f in spec.features:
+                _t = str(getattr(_f, "type", "")).lower()
+                _d = min(feature_depth(spec, _f), T)
+                if _t == "keyway":
+                    _v, _z = keyway_volume(_f, spec), T / 2.0
+                elif _t == "hole" and abs(_f.x) < 1e-6 and abs(_f.y) < 1e-6:
+                    _v = math.pi * (_f.diameter / 2.0) ** 2 * _d
+                    _z = T - _d / 2.0 if _f.depth and _f.depth > 0 else T / 2.0
+                elif (_t in ("step", "pocket") and abs(_f.x) < 1e-6
+                        and abs(_f.y) < 1e-6 and _f.length >= 2.0 * _Rmax - 1e-6
+                        and 0.0 < _f.width < 2.0 * _Rmax):
+                    _v = max(_slice(_Rmax, _f.width / 2.0)
+                             - _slice(_Rin, _f.width / 2.0), 0.0) * _d
+                    _z = T - _d / 2.0
+                else:
+                    return c
+                num -= _v * _z
+                den -= _v
+            return (0.0, 0.0, num / den if den > 1e-9 else float(c[2]))
     if spec.shaft_segments:
         z = 0.0
         num = 0.0
@@ -1935,20 +2317,22 @@ def centroid(spec: PartSpec, step: float = 0.1):
             vol += v
             z += L
         return (0.0, 0.0, num / vol if vol else 0.0)
-    X, Y, base, depth = _grid(spec, step)
-    h = np.clip(spec.thickness - depth, 0.0, spec.thickness) * base
-    tot = float(h.sum())
+    X, Y, base, _lo, _hi = _grid_depth(spec, step)
+    hh = np.maximum(_hi - _lo, 0.0) * base
+    tot = float(hh.sum())
     if tot <= 0:
         return (0.0, 0.0, 0.0)
     # 不再减"基体掩膜质心"：对称零件它恒为 0（所以长期没暴露），
     # 非对称零件（左圆弧头 + 右开口槽）会把它平移走 —— 实测 U 形叉
-    # 解析/NX/SW/CATIA 四家都是 +0.26，减了 bias 反而变成 −0.47。
+    # 解析/NX/SW 三家都是 +0.26，减了 bias 反而变成 −0.47。
     # Z 也要按材料真算：每根"柱"从 0 到 h，形心在 h/2，所以 z = Σ(h²/2)/Σh。
     # 原来直接返回 thickness/2，顶面开腔的零件（泵体 Ø125×85、腔深 50）会差 10mm+，
     # 质心核对必然误报。
-    zc = float((h * h).sum() / (2.0 * tot)) if tot > 0 else 0.0
-    return (float((X * h).sum() / tot),
-            float((Y * h).sum() / tot),
+    # 每根柱的形心在剩余材料区间中点 (lo+hi)/2 —— face=bottom 的件必须这样算，
+    # 直接用 h/2 会把底面切除当成顶面切除，z 质心偏移半个切深。
+    zc = float((hh * ((_lo + _hi) / 2.0)).sum() / tot) if tot > 0 else 0.0
+    return (float((X * hh).sum() / tot),
+            float((Y * hh).sum() / tot),
             zc)
 
 
@@ -1965,7 +2349,7 @@ def part_volume_simple(spec: PartSpec) -> float:
 def stock_size(spec: PartSpec, margin: float = 4.0):
     """毛坯尺寸（mm）。圆顶和扫掠体都必须包进毛坯，否则刀路一出去就撞夹具。
 
-    高度口径：Z0 = 毛坯顶面，基体顶面在 Z=thickness-毛坯高（CAM 里换算）。
+    高度口径：Z0 = 毛坯顶面，基体顶面在 Z=thickness-毛坯高（geometry 里换算）。
     """
     _dh = max(float(getattr(spec, "dome_h", 0.0) or 0.0), 0.0)
     _bb = sweep_bbox(spec)

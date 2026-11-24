@@ -30,3 +30,35 @@ tests/_local/
 settings.json
 *.token
 assets/icon_url.txt
+
+# Large local AI runtime and model blobs (not source)
+local_ai/
+smartmodel_backup/
+
+# Build artifacts and packaged distributions
+build_*/
+dist_*/
+"build_*/
+"dist_*/
+
+# Local temp / batch outputs
+tmp/
+"tmp/
+_batch/
+_tmp_archive/
+report.md
+
+# One-off debug and migration scripts
+_*.py
+_*.txt
+_*.json
+_*.ps1
+t_hello.py
+
+# Test screenshots and provider sample images
+docs/_prov19/
+
+# Codex temp files
+$null
+.patch_tmp
+app/_vision_impl.marshal

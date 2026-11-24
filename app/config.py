@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -53,12 +54,14 @@ class Settings:
     text_model: str = "qwen3.8-max"
     ocr_model: str = "qwen3.5-ocr"
     timeout: int = 180
+    # Offline local vision reader (Qwen2.5-VL 7B via bundled Ollama)
+    local_ai_enabled: bool = True
+    local_ai_model: str = "qwen2.5vl:7b"
+    local_ai_url: str = "http://127.0.0.1:11511"
+    local_ai_timeout: int = 180
     # CAD
     nx_root: str = r"D:\ug\NX 12.0"
     sw_template: str = r"C:\ProgramData\SolidWorks\SOLIDWORKS 2024\templates\零件.prtdot"
-    catia_exe: str = r"E:\catia\anzhuang\intel_a\code\bin\CATSTART.exe"
-    catia_env_dir: str = r"C:\ProgramData\DassaultSystemes\CATEnv"
-    catia_env_name: str = "CATIA_P3.V5R21.B21"
     # misc
     comfyui_dir: str = r"E:\ComfyUI\ComfyUI-aki-v3.2"
     comfyui_url: str = "http://127.0.0.1:8188"
@@ -78,12 +81,32 @@ class Settings:
                         setattr(s, k, v)
             except Exception:
                 pass
+        # 旧版本把本地模型指向 11434（系统 Ollama 的默认端口）。
+        # 现在随包运行时固定用 11511，避免与用户自己的 Ollama 抢端口。
+        if str(getattr(s, "local_ai_url", "")).rstrip("/") == "http://127.0.0.1:11434":
+            s.local_ai_url = "http://127.0.0.1:11511"
+        # 旧默认模型 qwen3-vl:2b 结构化读图不合格，已换成 7B。
+        if str(getattr(s, "local_ai_model", "") or "") in ("", "qwen3-vl:2b"):
+            s.local_ai_model = "qwen2.5vl:7b"
         cfg = _read_codex_toml()
         if not s.api_key:
             s.api_key = cfg.get("api_key", "") or os.environ.get("DASHSCOPE_API_KEY", "")
         if cfg.get("base_url") and not (p.exists() and json.loads(p.read_text(encoding="utf-8")).get("base_url")):
             s.base_url = cfg["base_url"]
-        if not s.output_dir:
+        if getattr(sys, "frozen", False):
+            # 打包版绝不能把结果写进程序自己的 _internal 目录：
+            # 那样覆盖安装/卸载时结果会丢失，而且用户根本找不到。
+            od = str(s.output_dir or "").strip()
+            bad = not od
+            if od:
+                try:
+                    base = Path(getattr(sys, "_MEIPASS", project_root())).resolve()
+                    bad = Path(od).resolve().is_relative_to(base)
+                except Exception:
+                    bad = "_internal" in od
+            if bad:
+                s.output_dir = str(Path.home() / "Documents" / "工程助手" / "输出")
+        elif not s.output_dir:
             s.output_dir = str(project_root() / "out")
         try:
             from .compat import apply_to_settings

@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
-MIN_VERSIONS = {"NX": "12.0", "SolidWorks": "2022", "CATIA": "R21"}
+MIN_VERSIONS = {"NX": "12.0", "SolidWorks": "2022"}
 
 
 @dataclass
@@ -29,7 +29,7 @@ class CadInfo:
 
     @property
     def meets_min(self) -> bool:
-        need = {"NX": 12.0, "SolidWorks": 2022.0, "CATIA": 21.0}[self.key]
+        need = {"NX": 12.0, "SolidWorks": 2022.0}[self.key]
         return self.found and self.numeric >= need
 
     def line(self) -> str:
@@ -175,42 +175,8 @@ def detect_sw() -> CadInfo:
     return info
 
 
-# ------------------------------------------------------------------ CATIA
-def detect_catia() -> CadInfo:
-    info = CadInfo("CATIA", "CATIA V5")
-    best = None
-    for k in _reg_subkeys(r"SOFTWARE\Dassault Systemes"):
-        m = re.match(r"B(\d+)$", k)
-        if not m:
-            continue
-        rel = int(m.group(1))
-        d = _reg(f"SOFTWARE\\Dassault Systemes\\{k}\\0")
-        dest = str(d.get("DEST_FOLDER") or "")
-        if not dest:
-            continue
-        if best is None or rel > best[0]:
-            best = (rel, k, dest)
-    if best:
-        rel, k, dest = best
-        start = Path(dest) / "intel_a" / "code" / "bin" / "CATSTART.exe"
-        info.found = start.exists()
-        info.path = dest
-        info.numeric = float(rel)
-        info.version = f"CATIA V5 R{rel}"
-        info.extra["catstart"] = str(start)
-        envdir = Path(r"C:\ProgramData\DassaultSystemes\CATEnv")
-        envname = ""
-        if envdir.exists():
-            files = sorted(envdir.glob(f"CATIA_P3.V5R{rel}.B{rel}.txt"))
-            if files:
-                envname = files[0].stem
-        info.extra["env_name"] = envname
-        info.extra["env_dir"] = str(envdir)
-    return info
-
-
 def detect_all() -> Dict[str, CadInfo]:
-    return {"NX": detect_nx(), "SolidWorks": detect_sw(), "CATIA": detect_catia()}
+    return {"NX": detect_nx(), "SolidWorks": detect_sw()}
 
 
 def apply_to_settings(s) -> Dict[str, CadInfo]:
@@ -222,21 +188,13 @@ def apply_to_settings(s) -> Dict[str, CadInfo]:
     sw = info["SolidWorks"]
     if sw.found and not Path(s.sw_template).exists() and sw.template:
         s.sw_template = sw.template
-    ct = info["CATIA"]
-    if ct.found:
-        if not Path(s.catia_exe).exists():
-            s.catia_exe = ct.extra.get("catstart", s.catia_exe)
-        if not getattr(s, "catia_env_name", ""):
-            s.catia_env_name = ct.extra.get("env_name", "")
-        if not getattr(s, "catia_env_dir", ""):
-            s.catia_env_dir = ct.extra.get("env_dir", "")
     return info
 
 
 def report_text() -> str:
     info = detect_all()
     lines = ["CAD 兼容性自检", ""]
-    for k in ("NX", "SolidWorks", "CATIA"):
+    for k in ("NX", "SolidWorks"):
         i = info[k]
         lines.append(i.line())
         if i.template:
@@ -244,6 +202,6 @@ def report_text() -> str:
         if i.notes:
             lines.append(f"  备注：{i.notes}")
         lines.append("")
-    lines.append("最低要求：NX 12.0+ / SOLIDWORKS 2022+ / CATIA V5 R21+")
+    lines.append("最低要求：NX 12.0+ / SOLIDWORKS 2022+")
     lines.append("说明：调用方式按版本自动选择（参数个数、模板路径、启动参数均自适应）")
     return "\n".join(lines)

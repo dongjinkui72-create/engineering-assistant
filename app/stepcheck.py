@@ -167,6 +167,7 @@ def parse_step(path: str, revolve: bool = False) -> Dict:
         if p1 and p2:
             circ_edges.setdefault(m.group(4), []).append(
                 (p1, p2, m.group(5).upper() == ".T."))
+    circle_recs: List[Dict] = []
     for m in CRERE.finditer(txt):
         pid = apt_point.get(m.group(2))
         q = pts.get(pid) if pid else None
@@ -184,6 +185,22 @@ def parse_step(path: str, revolve: bool = False) -> Dict:
         closed = any(all(abs(a[i] - b[i]) <= 1e-7 for i in range(3)) for a, b, _ in edges)
         if closed:
             closed_circles.append((c, ax, r))
+        # 记录每个圆的真实扫掠角：整圆=360°，槽端/圆角端=90°/180°。
+        # CAD 导入用它排除"半圆柱面被当成孔"的假孔（箱座槽端 Ø28 曾被误判成两个孔）。
+        sweep = 360.0 if closed else None
+        if not closed and edges:
+            total = 0.0
+            two_pi = 2.0 * math.pi
+            for p1, p2, forward in edges:
+                v1 = (p1[0] - c[0], p1[1] - c[1], p1[2] - c[2])
+                v2 = (p2[0] - c[0], p2[1] - c[1], p2[2] - c[2])
+                if math.sqrt(sum(t * t for t in v1)) <= 1e-9 or math.sqrt(sum(t * t for t in v2)) <= 1e-9:
+                    continue
+                a1 = math.atan2(sum(v1[i] * u2[i] for i in range(3)), sum(v1[i] * u1[i] for i in range(3)))
+                a2 = math.atan2(sum(v2[i] * u2[i] for i in range(3)), sum(v2[i] * u1[i] for i in range(3)))
+                total += ((a2 - a1) % two_pi) if forward else ((a1 - a2) % two_pi)
+            sweep = math.degrees(total)
+        circle_recs.append({"c": c, "r": r, "ax": ax, "sweep": sweep})
         if not edges or closed:
             for u in (u1, u2):
                 vpts.append((cx + r * u[0], cy + r * u[1], cz + r * u[2]))
@@ -197,7 +214,7 @@ def parse_step(path: str, revolve: bool = False) -> Dict:
                     vpts.append((cx - r * u[0], cy - r * u[1], cz - r * u[2]))
             else:
                 vpts.extend(ext)
-    # CATIA 把回转体的经向圆弧导成 B 样条（实测 degree=4、5 控制点、单段 Bezier）。
+    # NX 把回转体的经向圆弧导成 B 样条（实测 degree=4、5 控制点、单段 Bezier）。
     # 不采样会漏掉弧顶：cup_revolve 的 64 会被报成 60。
     for m in BSPLKRE.finditer(txt):
         try:
@@ -223,7 +240,10 @@ def parse_step(path: str, revolve: bool = False) -> Dict:
     spans = [max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)] if xs else [0.0, 0.0, 0.0]
     if revolve and (closed_circles or cyls):
         spans = _revolve_spans(use, closed_circles, cyls, spans)
-    return {"cylinders": cyls, "bbox": tuple(spans), "points": len(pts)}
+    bmin = (min(xs), min(ys), min(zs)) if xs else (0.0, 0.0, 0.0)
+    bmax = (max(xs), max(ys), max(zs)) if xs else (0.0, 0.0, 0.0)
+    return {"cylinders": cyls, "circles": circle_recs, "bbox": tuple(spans),
+            "points": len(pts), "bbox_min": bmin, "bbox_max": bmax}
 
 
 def expected_spans(spec: PartSpec):
@@ -270,7 +290,7 @@ def check(spec: PartSpec, path: str, tol: float = 0.05, bbox=None) -> Dict:
     info = parse_step(path, revolve=bool(getattr(spec, "revolve_profile", None)))
     got_bbox = info["bbox"]
     bbox_src = "step"
-    # 回转体：CATIA 的 STEP 把回转面导成 B 样条，经向极值取不到。
+    # 回转体：NX 的 STEP 把回转面导成 B 样条，经向极值取不到。
     # 适配器用 SPAWorkbench 实测的包围盒优先（来源会在报告里写明）。
     if bbox is not None and len(bbox) == 6:
         try:
